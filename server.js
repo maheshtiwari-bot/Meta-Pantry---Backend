@@ -45,11 +45,11 @@ const db = {
     ],
   },
   stock: [
-    { product: "Sleepy Owl Cold Brew", category: "Cold Coffee", min: "10 units", count: 8, rate: 6 },
-    { product: "Epigamia Greek Yogurt", category: "Greek Yogurt", min: "8 units", count: 14, rate: 5 },
-    { product: "Nectaras Kombucha", category: "Kombucha", min: "12 units", count: 22, rate: 8 },
-    { product: "Tetley Green Tea", category: "Herbal Tea", min: "6 boxes", count: 18, rate: 2 },
-    { product: "Britannia Good Day", category: "Biscuits", min: "10 packs", count: 42, rate: 6 },
+    { product: "Sleepy Owl Cold Brew", category: "Cold Coffee", min: "10 units", count: 8, rate: 6, price: 180 },
+    { product: "Epigamia Greek Yogurt", category: "Greek Yogurt", min: "8 units", count: 14, rate: 5, price: 60 },
+    { product: "Nectaras Kombucha", category: "Kombucha", min: "12 units", count: 22, rate: 8, price: 120 },
+    { product: "Tetley Green Tea", category: "Herbal Tea", min: "6 boxes", count: 18, rate: 2, price: 250 },
+    { product: "Britannia Good Day", category: "Biscuits", min: "10 packs", count: 42, rate: 6, price: 40 },
   ],
   locations: [
     { id: 1, name: "Floor 3 — Main Pantry", supervisor: "Ravi Kumar", contact: "+91 98400 00001", minDays: 3, freq: "Every 2 days", capacity: 500 },
@@ -90,12 +90,21 @@ const statusFor = (days) => (days < 2 ? "Critical" : days < 4 ? "Low" : "Healthy
 
 // ------------------------- Endpoints -------------------------
 
-// GET dashboard data (stats + category health)
+// GET dashboard data (stats + category health) — every stat below is
+// derived live from db.stock / db.categories, so it updates whenever
+// stock counts or category days change (e.g. after a stock count or
+// GRN acknowledgement).
 app.get("/api/dashboard", (req, res) => {
   const enriched = db.categories.map((c) => ({ ...c, status: statusFor(c.days) }));
+
+  const totalValue = db.stock.reduce((sum, s) => sum + s.count * (s.price || 0), 0);
+  const avgDays = enriched.length
+    ? enriched.reduce((sum, c) => sum + c.days, 0) / enriched.length
+    : 0;
+
   res.json({
-    totalStockValue: "₹2.4L",
-    daysOverall: 18,
+    totalStockValue: `₹${totalValue.toLocaleString("en-IN")}`,
+    daysOverall: +avgDays.toFixed(1),
     categoriesLow: enriched.filter((c) => c.status !== "Healthy").length,
     categoriesHealthy: enriched.filter((c) => c.status === "Healthy").length,
     categories: enriched,
