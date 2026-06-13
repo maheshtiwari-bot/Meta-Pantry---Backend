@@ -249,14 +249,26 @@ app.post("/api/stock", (req, res) => {
           subCategory: it.subCategory,
           min: "0 units",
           count: 0,
-          rate: 1,
+          rate: 0,
           price: 0,
         };
         db.stock.push(row);
       }
       row.category = it.category;
       row.subCategory = it.subCategory;
-      row.count = Number(it.count) || 0;
+
+      const newCount = Number(it.count) || 0;
+      // Recompute the daily consumption rate from how much was used since the
+      // last count (ignored if the count went up, e.g. after a distribution/GRN)
+      if (row.updatedAt) {
+        const daysSince = (Date.now() - new Date(row.updatedAt).getTime()) / (1000 * 60 * 60 * 24);
+        const consumed = row.count - newCount;
+        if (daysSince > 0.1 && consumed > 0) {
+          row.rate = +(consumed / daysSince).toFixed(2);
+        }
+      }
+
+      row.count = newCount;
       row.updatedAt = new Date().toISOString();
       row.updatedBy = person;
     });
@@ -314,6 +326,118 @@ app.get("/api/stock/history", (req, res) => {
   });
 
   res.json({ history, pendingSummary });
+});
+
+// GET product performance: average sale (consumption) per day per SKU,
+// measured at site level (summed across that site's sub site storages).
+// /api/performance?siteId=&category=&subCategory=
+app.get("/api/performance", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const { category, subCategory } = req.query;
+
+  const grouped = {};
+  db.stock
+    .filter((s) => s.siteId === siteId)
+    .filter((s) => !category || category === "All" || s.category === category)
+    .filter((s) => !subCategory || subCategory === "All" || s.subCategory === subCategory)
+    .forEach((r) => {
+      if (!grouped[r.product]) {
+        grouped[r.product] = { product: r.product, category: r.category, subCategory: r.subCategory, ratePerDay: 0 };
+      }
+      grouped[r.product].ratePerDay += r.rate || 0;
+    });
+
+  const rows = Object.values(grouped)
+    .map((r) => ({ ...r, ratePerDay: +r.ratePerDay.toFixed(2) }))
+    .sort((a, b) => b.ratePerDay - a.ratePerDay);
+
+  res.json(rows);
+});
+
+// GET reorder forecast for a site + sub storage (or subStorageId=all for the
+// whole site). Recommends pulling from Main Site Storage or ordering from a
+// vendor, based on available qty, avg sale/day and the storage's min-days target.
+// /api/forecast?siteId=&subStorageId=
+app.get("/api/forecast", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const { subStorageId } = req.query;
+  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
+
+  const withForecast = (r, minDays, isMainStorage) => {
+    const days = r.rate > 0 ? +(r.count / r.rate).toFixed(1) : null;
+    const reorderTarget = minDays * 2;
+    let recommendation = "Stock healthy — no action needed";
+    let suggestedQty = 0;
+    let source = "none";
+
+    if (days === null) {
+      recommendation = "No consumption data yet";
+    } else if (days < minDays) {
+      suggestedQty = Math.max(0, Math.ceil((reorderTarget - days) * r.rate));
+      if (suggestedQty > 0) {
+        const mainRow = !isMainStorage && main
+          ? db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === r.product)
+          : null;
+        const mainAvail = mainRow ? mainRow.count : 0;
+
+        if (mainAvail > 0) {
+          const fromMain = Math.min(suggestedQty, mainAvail);
+          const fromVendor = suggestedQty - fromMain;
+          if (fromVendor > 0) {
+            recommendation = `Request ${fromMain} units from Main Site Storage + order ${fromVendor} units from Vendor`;
+            source = "main+vendor";
+          } else {
+            recommendation = `Request ${fromMain} units from Main Site Storage`;
+            source = "main";
+          }
+        } else {
+          recommendation = `Order ${suggestedQty} units from Vendor`;
+          source = "vendor";
+        }
+      }
+    }
+
+    return {
+      product: r.product,
+      category: r.category,
+      subCategory: r.subCategory,
+      available: r.count,
+      ratePerDay: r.rate,
+      days,
+      status: days !== null ? statusFor(days) : "Unknown",
+      minDays,
+      recommendation,
+      suggestedQty,
+      source,
+    };
+  };
+
+  if (subStorageId === "all") {
+    const grouped = {};
+    db.stock
+      .filter((s) => s.siteId === siteId)
+      .forEach((r) => {
+        if (!grouped[r.product]) {
+          grouped[r.product] = { product: r.product, category: r.category, subCategory: r.subCategory, count: 0, rate: 0 };
+        }
+        grouped[r.product].count += r.count;
+        grouped[r.product].rate += r.rate || 0;
+      });
+    const minDays = main?.minDays ?? 2;
+    const rows = Object.values(grouped)
+      .map((r) => withForecast(r, minDays, true))
+      .sort((a, b) => (a.days ?? Infinity) - (b.days ?? Infinity));
+    return res.json(rows);
+  }
+
+  const subId = Number(subStorageId);
+  const sub = db.subStorages.find((s) => s.id === subId);
+  const minDays = sub?.minDays ?? 2;
+  const rows = db.stock
+    .filter((s) => s.siteId === siteId && s.subStorageId === subId)
+    .map((r) => withForecast(r, minDays, !!sub?.isMain))
+    .sort((a, b) => (a.days ?? Infinity) - (b.days ?? Infinity));
+  res.json(rows);
 });
 
 // ---- Sites CRUD (Admin panel; formerly "Warehouses") ----
@@ -510,14 +634,18 @@ app.post("/api/grns", (req, res) => {
 app.get("/api/products/taxonomy", (req, res) => res.json(db.productTaxonomy));
 
 // POST replace product taxonomy with rows parsed from the uploaded Excel file
-// expects: [{ sku, category, subCategory, mrp }, ...]
+// expects: [{ sku, category, subCategory, mrp, caseSize }, ...]
+// Each row is assigned a backend-generated unique "code" that can be used to
+// reference the product elsewhere (stock, performance, forecast, etc.)
 app.post("/api/products/taxonomy", (req, res) => {
   const rows = Array.isArray(req.body) ? req.body : [];
-  db.productTaxonomy = rows.map((r) => ({
+  db.productTaxonomy = rows.map((r, i) => ({
+    code: `SKU${String(i + 1).padStart(4, "0")}`,
     sku: String(r.sku ?? "").trim(),
     category: String(r.category ?? "").trim(),
     subCategory: String(r.subCategory ?? "").trim(),
     mrp: Number(r.mrp) || 0,
+    caseSize: Number(r.caseSize) || 0,
   }));
   res.json({ message: "Product taxonomy imported", count: db.productTaxonomy.length });
 });
