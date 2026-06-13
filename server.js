@@ -38,24 +38,11 @@ const db = {
     { name: "Biscuits", skus: 3, days: 6.0 },
     { name: "Herbal Tea", skus: 4, days: 7.2 },
   ],
-  grn: {
-    id: "SDX-2406-0047",
-    from: "Bengaluru DC",
-    status: "In transit",
-    items: [
-      { product: "Sleepy Owl Cold Brew Black", category: "Cold Coffee", qty: 48 },
-      { product: "Epigamia Greek Yogurt – Mango", category: "Greek Yogurt", qty: 34 },
-      { product: "Tetley Green Tea Immune", category: "Herbal Tea", qty: 24 },
-      { product: "Nectaras Kombucha Ginger", category: "Kombucha", qty: 60 },
-      { product: "Britannia Good Day Cookies", category: "Biscuits", qty: 72 },
-    ],
-  },
-
   // ---- Sites (formerly "warehouses") ----
   sites: [],
 
   // ---- Sub site storages: every site gets a non-deletable "Main Site
-  // Storage" (where GRN-acknowledged stock lands) plus any number of
+  // Storage" (where stock-inward quantities land) plus any number of
   // user-added sub storages (mini-kitchens, floors, etc.) ----
   subStorages: [],
 
@@ -74,27 +61,16 @@ const db = {
     { id: 2, name: "Sodexo Supplies" },
     { id: 3, name: "FreshMart Distributors" },
   ],
-  purchaseOrders: [
-    { id: 1, number: "PO/1/450/2026-27/0006342", vendorId: 1, date: "2026-06-08" },
-    { id: 2, number: "PO/1/451/2026-27/0006343", vendorId: 2, date: "2026-06-09" },
-    { id: 3, number: "PO/1/452/2026-27/0006344", vendorId: 3, date: "2026-06-10" },
-  ],
-  products: [
-    { barcode: "8901030875024", name: "Sleepy Owl Cold Brew Black", category: "Cold Coffee" },
-    { barcode: "8901030875031", name: "Epigamia Greek Yogurt – Mango", category: "Greek Yogurt" },
-    { barcode: "8901030875048", name: "Tetley Green Tea Immune", category: "Herbal Tea" },
-    { barcode: "8901030875055", name: "Nectaras Kombucha Ginger", category: "Kombucha" },
-    { barcode: "8901030875062", name: "Britannia Good Day Cookies", category: "Biscuits" },
-  ],
-
-  // ---- GRNs created via the "Add GRN" form ----
-  grns: [],
 
   // ---- Product taxonomy (uploaded via Admin > Product Taxonomy) ----
   productTaxonomy: [],
 
   // ---- Vendor orders placed from the Distribute tab (Main Site Storage) ----
   vendorOrders: [],
+
+  // ---- Monthly stock inward records (CSV upload or manual entry,
+  // confirmed into Main Site Storage) ----
+  stockInwards: [],
 };
 
 // ------------------------- Endpoints -------------------------
@@ -111,56 +87,18 @@ app.get("/api/dashboard", (req, res) => {
     ? enriched.reduce((sum, c) => sum + c.days, 0) / enriched.length
     : 0;
 
+  const recentStockInwards = db.stockInwards.slice(0, 5);
+  const recentVendorOrders = db.vendorOrders.slice(0, 5);
+
   res.json({
     totalStockValue: `₹${totalValue.toLocaleString("en-IN")}`,
     daysOverall: +avgDays.toFixed(1),
     categoriesLow: enriched.filter((c) => c.status !== "Healthy").length,
     categoriesHealthy: enriched.filter((c) => c.status === "Healthy").length,
     categories: enriched,
+    recentStockInwards,
+    recentVendorOrders,
   });
-});
-
-// GET pending GRN
-app.get("/api/grn", (req, res) => res.json(db.grn));
-
-// POST acknowledge GRN → adds received qty into the Main Site Storage of
-// the site the GRN came from, and bumps category "days remaining"
-app.post("/api/grn/acknowledge", (req, res) => {
-  const site = db.sites.find((s) => s.name === db.grn.from);
-  const main = site ? db.subStorages.find((ss) => ss.siteId === site.id && ss.isMain) : null;
-
-  db.grn.items.forEach((item) => {
-    if (main) {
-      let row = db.stock.find(
-        (s) => s.siteId === site.id && s.subStorageId === main.id && s.category === item.category
-      );
-      if (!row) {
-        row = {
-          siteId: site.id,
-          subStorageId: main.id,
-          product: item.product,
-          category: item.category,
-          subCategory: "",
-          min: "0 units",
-          count: 0,
-          rate: 1,
-          price: 0,
-          updatedAt: null,
-          updatedBy: null,
-        };
-        db.stock.push(row);
-      }
-      row.count += item.qty;
-      row.updatedAt = new Date().toISOString();
-      row.updatedBy = "GRN";
-    }
-
-    const cat = db.categories.find((c) => c.name === item.category);
-    if (cat) cat.days = +(cat.days + item.qty / 20).toFixed(1);
-  });
-
-  db.grn.status = "Received";
-  res.json({ message: "GRN acknowledged, stock updated", grn: db.grn });
 });
 
 // GET stock for a site + sub storage (or subStorageId=all for the
@@ -597,6 +535,10 @@ app.post("/api/sites/:siteId/auto-distribute/confirm", (req, res) => {
   res.json({ message: "Stock distributed from Main Site Storage" });
 });
 
+// GET all vendor orders placed (most recent first) — used by the
+// Dashboard "Vendor Orders / Demand" snapshot
+app.get("/api/vendor-orders", (req, res) => res.json(db.vendorOrders));
+
 // POST place a vendor order from Main Site Storage,
 // expects: { siteId, items: [{ product, category, subCategory, qty }] }
 app.post("/api/vendor-orders", (req, res) => {
@@ -635,31 +577,72 @@ app.delete("/api/vendors/:id", (req, res) => {
   res.json({ message: "Vendor deleted" });
 });
 
-// GET purchase orders, optionally filtered by vendor: /api/purchase-orders?vendorId=1
-app.get("/api/purchase-orders", (req, res) => {
-  const { vendorId } = req.query;
-  const pos = vendorId
-    ? db.purchaseOrders.filter((p) => p.vendorId === Number(vendorId))
-    : db.purchaseOrders;
-  res.json(pos);
+// ---- Stock Inward (monthly stock receiving via CSV upload or manual entry) ----
+
+// GET stock inward history for a site, most recent first
+app.get("/api/sites/:siteId/stock-inward/history", (req, res) => {
+  const siteId = Number(req.params.siteId);
+  res.json(db.stockInwards.filter((h) => h.siteId === siteId));
 });
 
-// GET products, optionally searched by barcode or name: /api/products?search=8901
-app.get("/api/products", (req, res) => {
-  const { search } = req.query;
-  if (!search) return res.json(db.products);
-  const q = search.toLowerCase();
-  res.json(db.products.filter((p) => p.barcode.includes(q) || p.name.toLowerCase().includes(q)));
-});
+// POST confirm a stock inward — adds the given quantities into the site's
+// Main Site Storage and bumps the matching category's "days remaining".
+// expects: { items: [{ sku, code, category, subCategory, qty }], source }
+app.post("/api/sites/:siteId/stock-inward", (req, res) => {
+  const siteId = Number(req.params.siteId);
+  const { items, source } = req.body || {};
+  const site = db.sites.find((s) => s.id === siteId);
+  if (!site) return res.status(404).json({ error: "Site not found" });
 
-// GET all GRNs created via the "Add GRN" form
-app.get("/api/grns", (req, res) => res.json(db.grns));
+  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
+  if (!main) return res.status(404).json({ error: "Site has no Main Site Storage" });
 
-// POST create a new GRN
-app.post("/api/grns", (req, res) => {
-  const grn = { id: `GRN-${Date.now()}`, status: "Pending", ...req.body };
-  db.grns.unshift(grn);
-  res.status(201).json(grn);
+  const itemsArr = (Array.isArray(items) ? items : []).filter((it) => Number(it.qty) > 0);
+
+  itemsArr.forEach((item) => {
+    const qty = Number(item.qty) || 0;
+    const taxonomy = db.productTaxonomy.find((p) => p.sku === item.sku);
+
+    let row = db.stock.find(
+      (s) => s.siteId === siteId && s.subStorageId === main.id && s.product === item.sku
+    );
+    if (!row) {
+      row = {
+        siteId,
+        subStorageId: main.id,
+        product: item.sku,
+        code: item.code || taxonomy?.code || "",
+        category: item.category || taxonomy?.category || "",
+        subCategory: item.subCategory || taxonomy?.subCategory || "",
+        min: "0 units",
+        count: 0,
+        rate: 0,
+        price: taxonomy?.mrp || 0,
+        updatedAt: null,
+        updatedBy: null,
+      };
+      db.stock.push(row);
+    }
+    row.count += qty;
+    row.updatedAt = new Date().toISOString();
+    row.updatedBy = "Stock Inward";
+
+    const cat = db.categories.find((c) => c.name === row.category);
+    if (cat) cat.days = +(cat.days + qty / 20).toFixed(1);
+  });
+
+  const record = {
+    id: Date.now(),
+    siteId,
+    site: site.name,
+    date: new Date().toISOString(),
+    source: source === "manual" ? "Manual" : "CSV upload",
+    itemCount: itemsArr.length,
+    totalQty: itemsArr.reduce((sum, it) => sum + (Number(it.qty) || 0), 0),
+  };
+  db.stockInwards.unshift(record);
+
+  res.json({ message: "Stock inwarded — added to Main Site Storage", record });
 });
 
 // ---- Product taxonomy (Admin panel: upload/download Excel) ----
