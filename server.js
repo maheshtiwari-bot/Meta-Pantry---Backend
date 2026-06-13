@@ -52,32 +52,15 @@ const db = {
   },
 
   // ---- Sites (formerly "warehouses") ----
-  sites: [
-    { id: 1, name: "Goa Airport" },
-    { id: 2, name: "Bengaluru DC" },
-    { id: 3, name: "Mumbai BKC" },
-  ],
+  sites: [],
 
   // ---- Sub site storages: every site gets a non-deletable "Main Site
   // Storage" (where GRN-acknowledged stock lands) plus any number of
   // user-added sub storages (mini-kitchens, floors, etc.) ----
-  subStorages: [
-    { id: 1, siteId: 1, name: "Main Site Storage", isMain: true, supervisor: "", contact: "", minDays: 2, freq: "Weekly", capacity: 500 },
-    { id: 2, siteId: 2, name: "Main Site Storage", isMain: true, supervisor: "", contact: "", minDays: 2, freq: "Weekly", capacity: 500 },
-    { id: 3, siteId: 3, name: "Main Site Storage", isMain: true, supervisor: "", contact: "", minDays: 2, freq: "Weekly", capacity: 500 },
-    { id: 4, siteId: 1, name: "Floor 3 — Main Pantry", isMain: false, supervisor: "Ravi Kumar", contact: "+91 98400 00001", minDays: 3, freq: "Every 2 days", capacity: 500 },
-    { id: 5, siteId: 1, name: "Floor 6 — Mini Kitchen", isMain: false, supervisor: "Priya Nair", contact: "+91 98400 00002", minDays: 2, freq: "Weekly", capacity: 250 },
-    { id: 6, siteId: 1, name: "Floor 9 — Café Corner", isMain: false, supervisor: "Ankit Sharma", contact: "+91 98400 00003", minDays: 2, freq: "Weekly", capacity: 200 },
-  ],
+  subStorages: [],
 
   // ---- Stock, tracked per (site, sub storage) ----
-  stock: [
-    { siteId: 1, subStorageId: 1, product: "Sleepy Owl Cold Brew", category: "Cold Coffee", subCategory: "Cold Brew", min: "10 units", count: 8, rate: 6, price: 180, updatedAt: null, updatedBy: null },
-    { siteId: 1, subStorageId: 1, product: "Epigamia Greek Yogurt", category: "Greek Yogurt", subCategory: "Plain", min: "8 units", count: 14, rate: 5, price: 60, updatedAt: null, updatedBy: null },
-    { siteId: 1, subStorageId: 1, product: "Nectaras Kombucha", category: "Kombucha", subCategory: "Ginger", min: "12 units", count: 22, rate: 8, price: 120, updatedAt: null, updatedBy: null },
-    { siteId: 1, subStorageId: 1, product: "Tetley Green Tea", category: "Herbal Tea", subCategory: "Green Tea", min: "6 boxes", count: 18, rate: 2, price: 250, updatedAt: null, updatedBy: null },
-    { siteId: 1, subStorageId: 1, product: "Britannia Good Day", category: "Biscuits", subCategory: "Cookies", min: "10 packs", count: 42, rate: 6, price: 40, updatedAt: null, updatedBy: null },
-  ],
+  stock: [],
 
   // ---- Stock count history (per site / sub storage, "all" = combined) ----
   stockHistory: [],
@@ -109,6 +92,9 @@ const db = {
 
   // ---- Product taxonomy (uploaded via Admin > Product Taxonomy) ----
   productTaxonomy: [],
+
+  // ---- Vendor orders placed from the Distribute tab (Main Site Storage) ----
+  vendorOrders: [],
 };
 
 // ------------------------- Endpoints -------------------------
@@ -516,53 +502,84 @@ app.delete("/api/sub-storages/:id", (req, res) => {
   res.json({ message: "Sub site storage deleted" });
 });
 
-// GET the distribute board for a site: Main Site Storage's available stock
-// plus the site's other sub storages and their current allocation per product
-app.get("/api/sites/:siteId/distribute-board", (req, res) => {
+// GET auto-distribute suggestions for a site + sub site storage.
+// For every SKU present anywhere at the site, shows the qty available at
+// the selected storage, its avg sale/day there, days of stock, and a
+// suggested reorder/restock qty (rounded up to whole cases) needed to
+// reach `targetDays` days of stock at that storage.
+// /api/sites/:siteId/auto-distribute?subStorageId=&targetDays=
+app.get("/api/sites/:siteId/auto-distribute", (req, res) => {
   const siteId = Number(req.params.siteId);
+  const subStorageId = Number(req.query.subStorageId);
+  const targetDays = Number(req.query.targetDays) || 2;
+
   const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
-  const subs = db.subStorages.filter((s) => s.siteId === siteId && !s.isMain);
+  const sub = db.subStorages.find((s) => s.id === subStorageId);
+  const isMain = !!sub?.isMain;
 
-  const rows = db.stock
-    .filter((s) => s.siteId === siteId && s.subStorageId === main?.id)
-    .map((r) => ({
-      product: r.product,
-      category: r.category,
-      subCategory: r.subCategory,
-      available: r.count,
-      allocations: subs.map((sub) => {
-        const subRow = db.stock.find(
-          (s) => s.siteId === siteId && s.subStorageId === sub.id && s.product === r.product
-        );
-        return { subStorageId: sub.id, qty: subRow ? subRow.count : 0 };
-      }),
-    }));
+  const products = [...new Set(db.stock.filter((s) => s.siteId === siteId).map((s) => s.product))];
 
-  res.json({ subStorages: subs, rows });
+  const rows = products.map((product) => {
+    const row = db.stock.find((s) => s.siteId === siteId && s.subStorageId === subStorageId && s.product === product);
+    const anyRow = row || db.stock.find((s) => s.siteId === siteId && s.product === product);
+
+    const available = row ? row.count : 0;
+    const rate = row ? row.rate || 0 : 0;
+    const days = rate > 0 ? +(available / rate).toFixed(1) : null;
+
+    const taxonomy = db.productTaxonomy.find((p) => p.sku === product);
+    const caseSize = Math.max(1, Number(taxonomy?.caseSize) || 1);
+
+    const deficit = rate > 0 ? Math.max(0, (targetDays - (days ?? 0)) * rate) : 0;
+    const suggestedQty = Math.ceil(deficit / caseSize) * caseSize;
+
+    const result = {
+      product,
+      category: anyRow.category,
+      subCategory: anyRow.subCategory,
+      caseSize,
+      available,
+      ratePerDay: rate,
+      days,
+      suggestedQty,
+    };
+
+    if (!isMain && main) {
+      const mainRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === product);
+      result.mainAvailable = mainRow ? mainRow.count : 0;
+    }
+
+    return result;
+  });
+
+  res.json({ siteId, subStorageId, isMain, rows });
 });
 
-// POST confirm a distribution from Main Site Storage to sub storages
-// expects: { siteId, allocations: [{ product, subStorageId, qty }] }
-app.post("/api/distribute", (req, res) => {
-  const { siteId, allocations } = req.body || {};
-  const sId = Number(siteId);
-  const main = db.subStorages.find((s) => s.siteId === sId && s.isMain);
+// POST confirm restocking a sub site storage from Main Site Storage,
+// expects: { subStorageId, items: [{ product, qty }] }. `qty` is the
+// additional quantity to move from Main into the sub storage (capped to
+// what Main actually has available).
+app.post("/api/sites/:siteId/auto-distribute/confirm", (req, res) => {
+  const siteId = Number(req.params.siteId);
+  const { subStorageId, items } = req.body || {};
+  const subId = Number(subStorageId);
+  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
   if (!main) return res.status(404).json({ error: "Site has no Main Site Storage" });
+  if (subId === main.id) return res.status(400).json({ error: "Cannot distribute to Main Site Storage" });
 
-  (allocations || []).forEach((a) => {
-    const mainRow = db.stock.find((s) => s.siteId === sId && s.subStorageId === main.id && s.product === a.product);
+  (items || []).forEach((it) => {
+    const qty = Math.max(0, Number(it.qty) || 0);
+    if (qty <= 0) return;
+    const mainRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === it.product);
     if (!mainRow) return;
+    const move = Math.min(qty, mainRow.count);
+    if (move <= 0) return;
 
-    const subStorageId = Number(a.subStorageId);
-    let subRow = db.stock.find((s) => s.siteId === sId && s.subStorageId === subStorageId && s.product === a.product);
-    const prevQty = subRow ? subRow.count : 0;
-    const newQty = Number(a.qty) || 0;
-    const delta = newQty - prevQty;
-
+    let subRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === subId && s.product === it.product);
     if (!subRow) {
       subRow = {
-        siteId: sId,
-        subStorageId,
+        siteId,
+        subStorageId: subId,
         product: mainRow.product,
         category: mainRow.category,
         subCategory: mainRow.subCategory,
@@ -573,11 +590,28 @@ app.post("/api/distribute", (req, res) => {
       };
       db.stock.push(subRow);
     }
-    subRow.count = newQty;
-    mainRow.count -= delta;
+    subRow.count += move;
+    mainRow.count -= move;
   });
 
-  res.json({ message: "Distribution confirmed" });
+  res.json({ message: "Stock distributed from Main Site Storage" });
+});
+
+// POST place a vendor order from Main Site Storage,
+// expects: { siteId, items: [{ product, category, subCategory, qty }] }
+app.post("/api/vendor-orders", (req, res) => {
+  const { siteId, items } = req.body || {};
+  const order = {
+    id: Date.now(),
+    siteId: Number(siteId),
+    site: db.sites.find((s) => s.id === Number(siteId))?.name,
+    vendor: "Vendiman",
+    items: items || [],
+    status: "Placed",
+    placedAt: new Date().toISOString(),
+  };
+  db.vendorOrders.unshift(order);
+  res.status(201).json({ message: "Order placed — Vendiman has been notified", order });
 });
 
 // ---- Vendors CRUD (Admin panel) ----
