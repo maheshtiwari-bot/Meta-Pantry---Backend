@@ -656,8 +656,8 @@ app.get("/api/products/taxonomy", (req, res) => res.json(db.productTaxonomy));
 // reference the product elsewhere (stock, performance, forecast, etc.)
 app.post("/api/products/taxonomy", (req, res) => {
   const rows = Array.isArray(req.body) ? req.body : [];
-  db.productTaxonomy = rows.map((r, i) => ({
-    code: `SKU${String(i + 1).padStart(4, "0")}`,
+  db.productTaxonomy = rows.map((r) => ({
+    code: String(r.code ?? "").trim(),
     sku: String(r.sku ?? "").trim(),
     category: String(r.category ?? "").trim(),
     subCategory: String(r.subCategory ?? "").trim(),
