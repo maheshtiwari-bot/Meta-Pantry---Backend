@@ -1,672 +1,440 @@
-/* ============================================================
-   Meta India — Pantry Inventory (Node.js backend)
-   ------------------------------------------------------------
-   BEGINNER NOTES:
-   • This is an Express server — it exposes "API endpoints"
-     (URLs) that the React frontend calls to read/save data.
-   • Data is stored in a simple JavaScript object ("db" below).
-     Later you can replace it with a real database like MongoDB
-     or PostgreSQL without changing the API shape.
-
-   How to run:
-     1. npm install
-     2. node server.js
-     3. Open http://localhost:5000/api/dashboard in a browser
-   ============================================================ */
-
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
-app.use(cors());          // lets the React app (port 5173) talk to this server (port 5000)
-app.use(express.json());  // lets us read JSON sent in request bodies
+app.use(cors());
+app.use(express.json());
 
-// Helper: turn "days left" into a status label
-const statusFor = (days) => (days < 2 ? "Critical" : days < 4 ? "Low" : "Healthy");
-
-// Expected gap (in days) between stock counts for a given frequency setting
-const FREQ_DAYS = { Daily: 1, "Every 2 days": 2, Weekly: 7 };
-
-// ------------------------- "Database" -------------------------
+// ─────────────────────────── Database ───────────────────────────
 const db = {
-  categories: [
-    { name: "Cold Coffee", skus: 4, days: 1.2 },
-    { name: "Protein Shakes", skus: 2, days: 0.8 },
-    { name: "Greek Yogurt", skus: 3, days: 2.1 },
-    { name: "Kombucha", skus: 2, days: 2.8 },
-    { name: "Aerated Beverages", skus: 5, days: 5.4 },
-    { name: "Biscuits", skus: 3, days: 6.0 },
-    { name: "Herbal Tea", skus: 4, days: 7.2 },
-  ],
-  // ---- Sites (formerly "warehouses") ----
-  sites: [],
-
-  // ---- Sub site storages: every site gets a non-deletable "Main Site
-  // Storage" (where stock-inward quantities land) plus any number of
-  // user-added sub storages (mini-kitchens, floors, etc.) ----
-  subStorages: [],
-
-  // ---- Stock, tracked per (site, sub storage) ----
-  stock: [],
-
-  // ---- Stock count history (per site / sub storage, "all" = combined) ----
-  stockHistory: [],
-
-  // ---- "All (Main + Sub Site Storages)" combined snapshot records ----
-  siteStockTotals: [],
-
-  // ---- Master data for the "Add GRN" form ----
-  vendors: [
-    { id: 1, name: "Anshul Enterprises" },
-    { id: 2, name: "Sodexo Supplies" },
-    { id: 3, name: "FreshMart Distributors" },
-  ],
-
-  // ---- Product taxonomy (uploaded via Admin > Product Taxonomy) ----
-  productTaxonomy: [],
-
-  // ---- Vendor orders placed from the Distribute tab (Main Site Storage) ----
-  vendorOrders: [],
-
-  // ---- Monthly stock inward records (CSV upload or manual entry,
-  // confirmed into Main Site Storage) ----
-  stockInwards: [],
+  sites: [],        // { id, name, preferredDays }
+  products: [],     // { id, code, name, brand, category, subCategory, mrp, caseSize, uom, hsnCode, gst, weight, status }
+  vendors: [],      // { id, name, products: "all" | [code,...] }
+  statusDefs: { critical: { from: 0, to: 2 }, healthy: { from: 2, to: 7 }, excessive: { from: 7, to: 9999 } },
+  users: [{ id: 1, loginId: "admin", password: "admin123", role: "admin", name: "Admin" }],
+  stockUpdate: [],  // { id, siteId, productCode, qty, preferredDaysOverride, updatedAt, updatedBy }
+  stockHistory: [], // { id, siteId, productCode, qty, updatedAt, updatedBy }
+  stockInwards: [], // { id, dcCode, from, to, vendor, items:[{hsnCode,productCode,productName,mrp,gst,qty}], date }
+  productPerformance: [], // { productCode, siteId, qtyPerDay, method:'manual'|'auto', updatedAt }
+  orders: [],       // { id, siteId, placedBy, items:[{productCode,productName,brand,qty,mrp}], status, createdAt, feedback }
 };
 
-// ------------------------- Endpoints -------------------------
+// ─────────────────────────── Helpers ───────────────────────────
+const statusFor = (days, defs) => {
+  const d = defs || db.statusDefs;
+  if (days === null || days === undefined) return "Unknown";
+  if (days <= d.critical.to) return "Critical";
+  if (days >= d.excessive.from) return "Excessive";
+  return "Healthy";
+};
 
-// GET dashboard data (stats + category health) — every stat below is
-// derived live from db.stock / db.categories, so it updates whenever
-// stock counts or category days change (e.g. after a stock count or
-// GRN acknowledgement).
+const getAvailDays = (productCode, siteId) => {
+  const su = db.stockUpdate.find(s => s.siteId === siteId && s.productCode === productCode);
+  const pp = db.productPerformance.find(p => p.productCode === productCode && p.siteId === siteId);
+  if (!su || !pp || !pp.qtyPerDay) return null;
+  return +(su.qty / pp.qtyPerDay).toFixed(2);
+};
+
+const getSitePreferredDays = (siteId, productCode) => {
+  const su = db.stockUpdate.find(s => s.siteId === siteId && s.productCode === productCode);
+  if (su && su.preferredDaysOverride != null) return su.preferredDaysOverride;
+  const site = db.sites.find(s => s.id === siteId);
+  return site ? (site.preferredDays || 5) : 5;
+};
+
+let orderSeq = 1;
+const nextOrderId = () => `ORD-${String(orderSeq++).padStart(5, "0")}`;
+
+// ─────────────────────────── Auth ───────────────────────────
+app.post("/api/auth/login", (req, res) => {
+  const { loginId, password } = req.body || {};
+  const user = db.users.find(u => u.loginId === loginId && u.password === password);
+  if (!user) return res.status(401).json({ error: "Invalid login ID or password" });
+  res.json({ id: user.id, loginId: user.loginId, name: user.name, role: user.role });
+});
+
+// ─────────────────────────── Dashboard ───────────────────────────
 app.get("/api/dashboard", (req, res) => {
-  const enriched = db.categories.map((c) => ({ ...c, status: statusFor(c.days) }));
+  const siteIds = req.query.siteIds
+    ? req.query.siteIds.split(",").map(Number)
+    : db.sites.map(s => s.id);
 
-  const totalValue = db.stock.reduce((sum, s) => sum + s.count * (s.price || 0), 0);
-  const avgDays = enriched.length
-    ? enriched.reduce((sum, c) => sum + c.days, 0) / enriched.length
-    : 0;
+  const rows = [];
+  siteIds.forEach(siteId => {
+    const site = db.sites.find(s => s.id === siteId);
+    if (!site) return;
+    db.stockUpdate
+      .filter(su => su.siteId === siteId)
+      .forEach(su => {
+        const prod = db.products.find(p => p.code === su.productCode);
+        if (!prod) return;
+        const days = getAvailDays(su.productCode, siteId);
+        rows.push({
+          siteId, siteName: site.name,
+          productCode: prod.code, productName: prod.name, brand: prod.brand,
+          category: prod.category, subCategory: prod.subCategory, mrp: prod.mrp,
+          availableQty: su.qty,
+          preferredDays: getSitePreferredDays(siteId, su.productCode),
+          availableDays: days,
+          status: statusFor(days, db.statusDefs),
+        });
+      });
+  });
 
-  const recentStockInwards = db.stockInwards.slice(0, 5);
-  const recentVendorOrders = db.vendorOrders.slice(0, 5);
+  const totalStockValue = rows.reduce((s, r) => s + r.availableQty * r.mrp, 0);
+  const withDays = rows.filter(r => r.availableDays !== null);
+  const avgDays = withDays.length ? +(withDays.reduce((s, r) => s + r.availableDays, 0) / withDays.length).toFixed(1) : 0;
 
   res.json({
-    totalStockValue: `₹${totalValue.toLocaleString("en-IN")}`,
-    daysOverall: +avgDays.toFixed(1),
-    categoriesLow: enriched.filter((c) => c.status !== "Healthy").length,
-    categoriesHealthy: enriched.filter((c) => c.status === "Healthy").length,
-    categories: enriched,
-    recentStockInwards,
-    recentVendorOrders,
+    totalStockValue: +totalStockValue.toFixed(2),
+    avgDaysOfStock: avgDays,
+    criticalCount: rows.filter(r => r.status === "Critical").length,
+    healthyCount: rows.filter(r => r.status === "Healthy").length,
+    excessiveCount: rows.filter(r => r.status === "Excessive").length,
+    rows,
   });
 });
 
-// GET stock for a site + sub storage (or subStorageId=all for the
-// combined Main + every sub storage view)
-app.get("/api/stock", (req, res) => {
-  const siteId = Number(req.query.siteId);
-  const { subStorageId } = req.query;
+// ─────────────────────────── Products ───────────────────────────
+app.get("/api/products", (req, res) => res.json(db.products));
 
-  const withDaysStatus = (r) => {
-    const days = r.rate > 0 ? +(r.count / r.rate).toFixed(1) : 0;
-    return { ...r, days, status: statusFor(days) };
-  };
-
-  if (subStorageId === "all") {
-    const grouped = {};
-    db.stock
-      .filter((s) => s.siteId === siteId)
-      .forEach((r) => {
-        if (!grouped[r.product]) {
-          grouped[r.product] = {
-            product: r.product,
-            category: r.category,
-            subCategory: r.subCategory,
-            min: r.min,
-            rate: r.rate,
-            price: r.price,
-            count: 0,
-          };
-        }
-        grouped[r.product].count += r.count;
-      });
-    return res.json(Object.values(grouped).map(withDaysStatus));
-  }
-
-  const subId = Number(subStorageId);
-  const rows = db.stock
-    .filter((s) => s.siteId === siteId && s.subStorageId === subId)
-    .map(withDaysStatus);
-  res.json(rows);
+app.post("/api/products", (req, res) => {
+  const p = req.body;
+  if (db.products.find(x => x.code === p.code))
+    return res.status(400).json({ error: `Product Code "${p.code}" already exists` });
+  if (db.products.find(x => x.name.toLowerCase() === (p.name || "").toLowerCase()))
+    return res.status(400).json({ error: `Product Name "${p.name}" already exists` });
+  const product = { id: Date.now(), ...p };
+  db.products.push(product);
+  res.status(201).json(product);
 });
 
-// POST submit a new physical stock count for a site + sub storage
-// expects: { siteId, subStorageId, person, items: [{ product, category, subCategory, count }] }
-app.post("/api/stock", (req, res) => {
-  const { siteId, subStorageId, person, items } = req.body || {};
-  const sId = Number(siteId);
-  const itemsArr = Array.isArray(items) ? items : [];
-
-  if (subStorageId === "all") {
-    itemsArr.forEach((it) => {
-      let rec = db.siteStockTotals.find((t) => t.siteId === sId && t.product === it.product);
-      if (!rec) {
-        rec = { siteId: sId, product: it.product, category: it.category, subCategory: it.subCategory, count: 0 };
-        db.siteStockTotals.push(rec);
-      }
-      rec.category = it.category;
-      rec.subCategory = it.subCategory;
-      rec.count = Number(it.count) || 0;
-      rec.updatedAt = new Date().toISOString();
-      rec.updatedBy = person;
-    });
-  } else {
-    const subId = Number(subStorageId);
-    itemsArr.forEach((it) => {
-      let row = db.stock.find((s) => s.siteId === sId && s.subStorageId === subId && s.product === it.product);
-      if (!row) {
-        row = {
-          siteId: sId,
-          subStorageId: subId,
-          product: it.product,
-          category: it.category,
-          subCategory: it.subCategory,
-          min: "0 units",
-          count: 0,
-          rate: 0,
-          price: 0,
-        };
-        db.stock.push(row);
-      }
-      row.category = it.category;
-      row.subCategory = it.subCategory;
-
-      const newCount = Number(it.count) || 0;
-      // Recompute the daily consumption rate from how much was used since the
-      // last count (ignored if the count went up, e.g. after a distribution/GRN)
-      if (row.updatedAt) {
-        const daysSince = (Date.now() - new Date(row.updatedAt).getTime()) / (1000 * 60 * 60 * 24);
-        const consumed = row.count - newCount;
-        if (daysSince > 0.1 && consumed > 0) {
-          row.rate = +(consumed / daysSince).toFixed(2);
-        }
-      }
-
-      row.count = newCount;
-      row.updatedAt = new Date().toISOString();
-      row.updatedBy = person;
-    });
-  }
-
-  db.stockHistory.unshift({
-    id: Date.now(),
-    siteId: sId,
-    subStorageId: subStorageId === "all" ? "all" : Number(subStorageId),
-    person,
-    date: new Date().toISOString(),
-    itemCount: itemsArr.length,
-  });
-
-  res.json({ message: "Stock count submitted" });
+app.put("/api/products/:code", (req, res) => {
+  const prod = db.products.find(p => p.code === req.params.code);
+  if (!prod) return res.status(404).json({ error: "Product not found" });
+  const duplicate = db.products.find(p => p.name.toLowerCase() === (req.body.name || "").toLowerCase() && p.code !== req.params.code);
+  if (duplicate) return res.status(400).json({ error: `Product Name "${req.body.name}" already exists` });
+  Object.assign(prod, req.body, { code: prod.code });
+  res.json(prod);
 });
 
-// GET stock count history + "pending" summary for a site
-app.get("/api/stock/history", (req, res) => {
-  const siteId = Number(req.query.siteId);
-  const subs = db.subStorages.filter((s) => s.siteId === siteId);
-
-  const history = db.stockHistory
-    .filter((h) => h.siteId === siteId)
-    .map((h) => {
-      const name =
-        h.subStorageId === "all"
-          ? "All (Main + Sub Site Storages)"
-          : subs.find((s) => s.id === h.subStorageId)?.name ?? `#${h.subStorageId}`;
-      return { ...h, subStorageName: name };
-    })
-    .sort((a, b) => new Date(b.date) - new Date(a.date));
-
-  const pendingSummary = subs.map((sub) => {
-    const last = db.stockHistory
-      .filter((h) => h.siteId === siteId && h.subStorageId === sub.id)
-      .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-    const expected = FREQ_DAYS[sub.freq] ?? 7;
-    let daysSince = null;
-    let pending = true;
-    if (last) {
-      daysSince = (Date.now() - new Date(last.date).getTime()) / (1000 * 60 * 60 * 24);
-      pending = daysSince > expected;
-    }
-    return {
-      subStorageId: sub.id,
-      name: sub.name,
-      isMain: sub.isMain,
-      lastUpdated: last ? last.date : null,
-      person: last ? last.person : null,
-      freq: sub.freq,
-      pending,
-      daysSince: daysSince !== null ? +daysSince.toFixed(1) : null,
-    };
-  });
-
-  res.json({ history, pendingSummary });
+app.delete("/api/products/:code", (req, res) => {
+  db.products = db.products.filter(p => p.code !== req.params.code);
+  res.json({ message: "Deleted" });
 });
 
-// GET product performance: average sale (consumption) per day per SKU,
-// measured at site level (summed across that site's sub site storages).
-// /api/performance?siteId=&category=&subCategory=
-app.get("/api/performance", (req, res) => {
-  const siteId = Number(req.query.siteId);
-  const { category, subCategory } = req.query;
+// Legacy taxonomy endpoint — returns products in old format for backward compat
+app.get("/api/products/taxonomy", (req, res) =>
+  res.json(db.products.map(p => ({ code: p.code, sku: p.name, category: p.category, subCategory: p.subCategory, mrp: p.mrp, caseSize: p.caseSize })))
+);
 
-  const grouped = {};
-  db.stock
-    .filter((s) => s.siteId === siteId)
-    .filter((s) => !category || category === "All" || s.category === category)
-    .filter((s) => !subCategory || subCategory === "All" || s.subCategory === subCategory)
-    .forEach((r) => {
-      if (!grouped[r.product]) {
-        grouped[r.product] = { product: r.product, category: r.category, subCategory: r.subCategory, ratePerDay: 0 };
-      }
-      grouped[r.product].ratePerDay += r.rate || 0;
-    });
-
-  const rows = Object.values(grouped)
-    .map((r) => ({ ...r, ratePerDay: +r.ratePerDay.toFixed(2) }))
-    .sort((a, b) => b.ratePerDay - a.ratePerDay);
-
-  res.json(rows);
-});
-
-// GET reorder forecast for a site + sub storage (or subStorageId=all for the
-// whole site). Recommends pulling from Main Site Storage or ordering from a
-// vendor, based on available qty, avg sale/day and the storage's min-days target.
-// /api/forecast?siteId=&subStorageId=
-app.get("/api/forecast", (req, res) => {
-  const siteId = Number(req.query.siteId);
-  const { subStorageId } = req.query;
-  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
-
-  const withForecast = (r, minDays, isMainStorage) => {
-    const days = r.rate > 0 ? +(r.count / r.rate).toFixed(1) : null;
-    const reorderTarget = minDays * 2;
-    let recommendation = "Stock healthy — no action needed";
-    let suggestedQty = 0;
-    let source = "none";
-
-    if (days === null) {
-      recommendation = "No consumption data yet";
-    } else if (days < minDays) {
-      suggestedQty = Math.max(0, Math.ceil((reorderTarget - days) * r.rate));
-      if (suggestedQty > 0) {
-        const mainRow = !isMainStorage && main
-          ? db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === r.product)
-          : null;
-        const mainAvail = mainRow ? mainRow.count : 0;
-
-        if (mainAvail > 0) {
-          const fromMain = Math.min(suggestedQty, mainAvail);
-          const fromVendor = suggestedQty - fromMain;
-          if (fromVendor > 0) {
-            recommendation = `Request ${fromMain} units from Main Site Storage + order ${fromVendor} units from Vendor`;
-            source = "main+vendor";
-          } else {
-            recommendation = `Request ${fromMain} units from Main Site Storage`;
-            source = "main";
-          }
-        } else {
-          recommendation = `Order ${suggestedQty} units from Vendor`;
-          source = "vendor";
-        }
-      }
-    }
-
-    return {
-      product: r.product,
-      category: r.category,
-      subCategory: r.subCategory,
-      available: r.count,
-      ratePerDay: r.rate,
-      days,
-      status: days !== null ? statusFor(days) : "Unknown",
-      minDays,
-      recommendation,
-      suggestedQty,
-      source,
-    };
-  };
-
-  if (subStorageId === "all") {
-    const grouped = {};
-    db.stock
-      .filter((s) => s.siteId === siteId)
-      .forEach((r) => {
-        if (!grouped[r.product]) {
-          grouped[r.product] = { product: r.product, category: r.category, subCategory: r.subCategory, count: 0, rate: 0 };
-        }
-        grouped[r.product].count += r.count;
-        grouped[r.product].rate += r.rate || 0;
-      });
-    const minDays = main?.minDays ?? 2;
-    const rows = Object.values(grouped)
-      .map((r) => withForecast(r, minDays, true))
-      .sort((a, b) => (a.days ?? Infinity) - (b.days ?? Infinity));
-    return res.json(rows);
-  }
-
-  const subId = Number(subStorageId);
-  const sub = db.subStorages.find((s) => s.id === subId);
-  const minDays = sub?.minDays ?? 2;
-  const rows = db.stock
-    .filter((s) => s.siteId === siteId && s.subStorageId === subId)
-    .map((r) => withForecast(r, minDays, !!sub?.isMain))
-    .sort((a, b) => (a.days ?? Infinity) - (b.days ?? Infinity));
-  res.json(rows);
-});
-
-// ---- Sites CRUD (Admin panel; formerly "Warehouses") ----
+// ─────────────────────────── Sites ───────────────────────────
 app.get("/api/sites", (req, res) => res.json(db.sites));
 
 app.post("/api/sites", (req, res) => {
-  const site = { id: Date.now(), ...req.body };
+  if (db.sites.find(s => s.name.toLowerCase() === (req.body.name || "").toLowerCase()))
+    return res.status(400).json({ error: "Site name already exists" });
+  const site = { id: Date.now(), preferredDays: 5, ...req.body };
   db.sites.push(site);
-  db.subStorages.push({
-    id: Date.now() + 1,
-    siteId: site.id,
-    name: "Main Site Storage",
-    isMain: true,
-    supervisor: "",
-    contact: "",
-    minDays: 2,
-    freq: "Weekly",
-    capacity: 500,
-  });
   res.status(201).json(site);
 });
 
 app.put("/api/sites/:id", (req, res) => {
-  const site = db.sites.find((s) => s.id === Number(req.params.id));
+  const site = db.sites.find(s => s.id === Number(req.params.id));
   if (!site) return res.status(404).json({ error: "Site not found" });
-  Object.assign(site, req.body);
+  Object.assign(site, req.body, { id: site.id });
   res.json(site);
 });
 
 app.delete("/api/sites/:id", (req, res) => {
-  const id = Number(req.params.id);
-  db.sites = db.sites.filter((s) => s.id !== id);
-  db.subStorages = db.subStorages.filter((ss) => ss.siteId !== id);
-  db.stock = db.stock.filter((s) => s.siteId !== id);
-  res.json({ message: "Site deleted" });
+  db.sites = db.sites.filter(s => s.id !== Number(req.params.id));
+  res.json({ message: "Deleted" });
 });
 
-// ---- Sub site storages CRUD (Settings tab) ----
-app.get("/api/sites/:siteId/sub-storages", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  const subs = db.subStorages.filter((s) => s.siteId === siteId);
-  subs.sort((a, b) => Number(b.isMain) - Number(a.isMain));
-  res.json(subs);
-});
-
-app.post("/api/sites/:siteId/sub-storages", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  const sub = {
-    supervisor: "",
-    contact: "",
-    minDays: 2,
-    freq: "Weekly",
-    capacity: 100,
-    ...req.body,
-    id: Date.now(),
-    siteId,
-    isMain: false,
-  };
-  db.subStorages.push(sub);
-  res.status(201).json(sub);
-});
-
-app.put("/api/sub-storages/:id", (req, res) => {
-  const sub = db.subStorages.find((s) => s.id === Number(req.params.id));
-  if (!sub) return res.status(404).json({ error: "Sub site storage not found" });
-  Object.assign(sub, req.body, { isMain: sub.isMain });
-  res.json(sub);
-});
-
-app.delete("/api/sub-storages/:id", (req, res) => {
-  const sub = db.subStorages.find((s) => s.id === Number(req.params.id));
-  if (!sub) return res.status(404).json({ error: "Sub site storage not found" });
-  if (sub.isMain) return res.status(400).json({ error: "Cannot delete Main Site Storage" });
-  db.subStorages = db.subStorages.filter((s) => s.id !== sub.id);
-  db.stock = db.stock.filter((s) => s.subStorageId !== sub.id);
-  res.json({ message: "Sub site storage deleted" });
-});
-
-// GET auto-distribute suggestions for a site + sub site storage.
-// For every SKU present anywhere at the site, shows the qty available at
-// the selected storage, its avg sale/day there, days of stock, and a
-// suggested reorder/restock qty (rounded up to whole cases) needed to
-// reach `targetDays` days of stock at that storage.
-// /api/sites/:siteId/auto-distribute?subStorageId=&targetDays=
-app.get("/api/sites/:siteId/auto-distribute", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  const subStorageId = Number(req.query.subStorageId);
-  const targetDays = Number(req.query.targetDays) || 2;
-
-  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
-  const sub = db.subStorages.find((s) => s.id === subStorageId);
-  const isMain = !!sub?.isMain;
-
-  const products = [...new Set(db.stock.filter((s) => s.siteId === siteId).map((s) => s.product))];
-
-  const rows = products.map((product) => {
-    const row = db.stock.find((s) => s.siteId === siteId && s.subStorageId === subStorageId && s.product === product);
-    const anyRow = row || db.stock.find((s) => s.siteId === siteId && s.product === product);
-
-    const available = row ? row.count : 0;
-    const rate = row ? row.rate || 0 : 0;
-    const days = rate > 0 ? +(available / rate).toFixed(1) : null;
-
-    const taxonomy = db.productTaxonomy.find((p) => p.sku === product);
-    const caseSize = Math.max(1, Number(taxonomy?.caseSize) || 1);
-
-    const deficit = rate > 0 ? Math.max(0, (targetDays - (days ?? 0)) * rate) : 0;
-    const suggestedQty = Math.ceil(deficit / caseSize) * caseSize;
-
-    const result = {
-      product,
-      category: anyRow.category,
-      subCategory: anyRow.subCategory,
-      caseSize,
-      available,
-      ratePerDay: rate,
-      days,
-      suggestedQty,
-    };
-
-    if (!isMain && main) {
-      const mainRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === product);
-      result.mainAvailable = mainRow ? mainRow.count : 0;
-    }
-
-    return result;
-  });
-
-  res.json({ siteId, subStorageId, isMain, rows });
-});
-
-// POST confirm restocking a sub site storage from Main Site Storage,
-// expects: { subStorageId, items: [{ product, qty }] }. `qty` is the
-// additional quantity to move from Main into the sub storage (capped to
-// what Main actually has available).
-app.post("/api/sites/:siteId/auto-distribute/confirm", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  const { subStorageId, items } = req.body || {};
-  const subId = Number(subStorageId);
-  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
-  if (!main) return res.status(404).json({ error: "Site has no Main Site Storage" });
-  if (subId === main.id) return res.status(400).json({ error: "Cannot distribute to Main Site Storage" });
-
-  (items || []).forEach((it) => {
-    const qty = Math.max(0, Number(it.qty) || 0);
-    if (qty <= 0) return;
-    const mainRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === main.id && s.product === it.product);
-    if (!mainRow) return;
-    const move = Math.min(qty, mainRow.count);
-    if (move <= 0) return;
-
-    let subRow = db.stock.find((s) => s.siteId === siteId && s.subStorageId === subId && s.product === it.product);
-    if (!subRow) {
-      subRow = {
-        siteId,
-        subStorageId: subId,
-        product: mainRow.product,
-        category: mainRow.category,
-        subCategory: mainRow.subCategory,
-        min: mainRow.min,
-        count: 0,
-        rate: mainRow.rate,
-        price: mainRow.price,
-      };
-      db.stock.push(subRow);
-    }
-    subRow.count += move;
-    mainRow.count -= move;
-  });
-
-  res.json({ message: "Stock distributed from Main Site Storage" });
-});
-
-// GET all vendor orders placed (most recent first) — used by the
-// Dashboard "Vendor Orders / Demand" snapshot
-app.get("/api/vendor-orders", (req, res) => res.json(db.vendorOrders));
-
-// POST place a vendor order from Main Site Storage,
-// expects: { siteId, items: [{ product, category, subCategory, qty }] }
-app.post("/api/vendor-orders", (req, res) => {
-  const { siteId, items } = req.body || {};
-  const order = {
-    id: Date.now(),
-    siteId: Number(siteId),
-    site: db.sites.find((s) => s.id === Number(siteId))?.name,
-    vendor: "Vendiman",
-    items: items || [],
-    status: "Placed",
-    placedAt: new Date().toISOString(),
-  };
-  db.vendorOrders.unshift(order);
-  res.status(201).json({ message: "Order placed — Vendiman has been notified", order });
-});
-
-// ---- Vendors CRUD (Admin panel) ----
+// ─────────────────────────── Vendors ───────────────────────────
 app.get("/api/vendors", (req, res) => res.json(db.vendors));
 
 app.post("/api/vendors", (req, res) => {
-  const vendor = { id: Date.now(), ...req.body };
+  const vendor = { id: Date.now(), products: "all", ...req.body };
   db.vendors.push(vendor);
   res.status(201).json(vendor);
 });
 
 app.put("/api/vendors/:id", (req, res) => {
-  const vendor = db.vendors.find((v) => v.id === Number(req.params.id));
-  if (!vendor) return res.status(404).json({ error: "Vendor not found" });
-  Object.assign(vendor, req.body);
-  res.json(vendor);
+  const v = db.vendors.find(v => v.id === Number(req.params.id));
+  if (!v) return res.status(404).json({ error: "Vendor not found" });
+  Object.assign(v, req.body, { id: v.id });
+  res.json(v);
 });
 
 app.delete("/api/vendors/:id", (req, res) => {
-  db.vendors = db.vendors.filter((v) => v.id !== Number(req.params.id));
-  res.json({ message: "Vendor deleted" });
+  db.vendors = db.vendors.filter(v => v.id !== Number(req.params.id));
+  res.json({ message: "Deleted" });
 });
 
-// ---- Stock Inward (monthly stock receiving via CSV upload or manual entry) ----
+// ─────────────────────────── Status Definitions ───────────────────────────
+app.get("/api/status-defs", (req, res) => res.json(db.statusDefs));
 
-// GET stock inward history for a site, most recent first
-app.get("/api/sites/:siteId/stock-inward/history", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  res.json(db.stockInwards.filter((h) => h.siteId === siteId));
+app.put("/api/status-defs", (req, res) => {
+  Object.assign(db.statusDefs, req.body);
+  res.json(db.statusDefs);
 });
 
-// POST confirm a stock inward — adds the given quantities into the site's
-// Main Site Storage and bumps the matching category's "days remaining".
-// expects: { items: [{ sku, code, category, subCategory, qty }], source }
-app.post("/api/sites/:siteId/stock-inward", (req, res) => {
-  const siteId = Number(req.params.siteId);
-  const { items, source } = req.body || {};
-  const site = db.sites.find((s) => s.id === siteId);
-  if (!site) return res.status(404).json({ error: "Site not found" });
+// ─────────────────────────── Users ───────────────────────────
+app.get("/api/users", (req, res) => res.json(db.users.map(u => ({ ...u, password: undefined }))));
 
-  const main = db.subStorages.find((s) => s.siteId === siteId && s.isMain);
-  if (!main) return res.status(404).json({ error: "Site has no Main Site Storage" });
+app.post("/api/users", (req, res) => {
+  if (db.users.find(u => u.loginId === req.body.loginId))
+    return res.status(400).json({ error: "Login ID already exists" });
+  const user = { id: Date.now(), ...req.body };
+  db.users.push(user);
+  res.status(201).json({ ...user, password: undefined });
+});
 
-  const itemsArr = (Array.isArray(items) ? items : []).filter((it) => Number(it.qty) > 0);
+app.put("/api/users/:id", (req, res) => {
+  const user = db.users.find(u => u.id === Number(req.params.id));
+  if (!user) return res.status(404).json({ error: "User not found" });
+  const dup = db.users.find(u => u.loginId === req.body.loginId && u.id !== user.id);
+  if (dup) return res.status(400).json({ error: "Login ID already taken" });
+  Object.assign(user, req.body, { id: user.id });
+  res.json({ ...user, password: undefined });
+});
 
-  itemsArr.forEach((item) => {
-    const qty = Number(item.qty) || 0;
-    const taxonomy = db.productTaxonomy.find((p) => p.sku === item.sku);
+app.delete("/api/users/:id", (req, res) => {
+  db.users = db.users.filter(u => u.id !== Number(req.params.id));
+  res.json({ message: "Deleted" });
+});
 
-    let row = db.stock.find(
-      (s) => s.siteId === siteId && s.subStorageId === main.id && s.product === item.sku
-    );
-    if (!row) {
-      row = {
-        siteId,
-        subStorageId: main.id,
-        product: item.sku,
-        code: item.code || taxonomy?.code || "",
-        category: item.category || taxonomy?.category || "",
-        subCategory: item.subCategory || taxonomy?.subCategory || "",
-        min: "0 units",
-        count: 0,
-        rate: 0,
-        price: taxonomy?.mrp || 0,
-        updatedAt: null,
-        updatedBy: null,
+// ─────────────────────────── Stock Update ───────────────────────────
+app.get("/api/stock-update", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const rows = db.stockUpdate
+    .filter(s => s.siteId === siteId)
+    .map(s => {
+      const prod = db.products.find(p => p.code === s.productCode) || {};
+      return {
+        ...s,
+        productName: prod.name || s.productCode,
+        brand: prod.brand || "",
+        category: prod.category || "",
+        subCategory: prod.subCategory || "",
+        mrp: prod.mrp || 0,
+        caseSize: prod.caseSize || 1,
+        hsnCode: prod.hsnCode || "",
+        uom: prod.uom || "",
+        preferredDays: getSitePreferredDays(siteId, s.productCode),
       };
-      db.stock.push(row);
-    }
-    row.count += qty;
-    row.updatedAt = new Date().toISOString();
-    row.updatedBy = "Stock Inward";
+    });
+  res.json(rows);
+});
 
-    const cat = db.categories.find((c) => c.name === row.category);
-    if (cat) cat.days = +(cat.days + qty / 20).toFixed(1);
-  });
+app.post("/api/stock-update", (req, res) => {
+  const { siteId, productCode, qty, preferredDaysOverride, updatedBy } = req.body;
+  let row = db.stockUpdate.find(s => s.siteId === Number(siteId) && s.productCode === productCode);
+  if (!row) {
+    row = { id: Date.now(), siteId: Number(siteId), productCode, qty: 0 };
+    db.stockUpdate.push(row);
+  }
+  const prevQty = row.qty;
+  row.qty = Number(qty);
+  if (preferredDaysOverride != null) row.preferredDaysOverride = Number(preferredDaysOverride);
+  row.updatedAt = new Date().toISOString();
+  row.updatedBy = updatedBy || "System";
 
+  db.stockHistory.unshift({ id: Date.now(), siteId: Number(siteId), productCode, prevQty, qty: row.qty, updatedAt: row.updatedAt, updatedBy: row.updatedBy });
+  res.json(row);
+});
+
+app.get("/api/stock-update/history", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const hist = db.stockHistory
+    .filter(h => h.siteId === siteId)
+    .map(h => {
+      const prod = db.products.find(p => p.code === h.productCode) || {};
+      return { ...h, productName: prod.name || h.productCode };
+    });
+  res.json(hist);
+});
+
+// ─────────────────────────── Stock Inward ───────────────────────────
+app.get("/api/stock-inward/history", (req, res) => {
+  const siteId = req.query.siteId ? Number(req.query.siteId) : null;
+  const list = siteId ? db.stockInwards.filter(s => s.to === siteId) : db.stockInwards;
+  res.json(list);
+});
+
+// Legacy per-site history
+app.get("/api/sites/:siteId/stock-inward/history", (req, res) => {
+  res.json(db.stockInwards.filter(s => s.to === Number(req.params.siteId)));
+});
+
+app.post("/api/stock-inward", (req, res) => {
+  const { dcCode, from, to, vendor, items } = req.body;
   const record = {
     id: Date.now(),
-    siteId,
-    site: site.name,
+    dcCode,
+    from: Number(from),
+    to: Number(to),
+    vendor: Number(vendor),
+    items: Array.isArray(items) ? items : [],
     date: new Date().toISOString(),
-    source: source === "manual" ? "Manual" : "CSV upload",
-    itemCount: itemsArr.length,
-    totalQty: itemsArr.reduce((sum, it) => sum + (Number(it.qty) || 0), 0),
+    status: "Confirmed",
   };
   db.stockInwards.unshift(record);
 
-  res.json({ message: "Stock inwarded — added to Main Site Storage", record });
+  // Add quantities to stock update for the destination site
+  record.items.forEach(it => {
+    const qty = Number(it.qty) || 0;
+    if (!qty || !it.productCode) return;
+    let row = db.stockUpdate.find(s => s.siteId === Number(to) && s.productCode === it.productCode);
+    if (!row) {
+      row = { id: Date.now(), siteId: Number(to), productCode: it.productCode, qty: 0, updatedAt: null, updatedBy: null };
+      db.stockUpdate.push(row);
+    }
+    row.qty += qty;
+    row.updatedAt = new Date().toISOString();
+    row.updatedBy = "Stock Inward";
+  });
+
+  res.status(201).json(record);
 });
 
-// ---- Product taxonomy (Admin panel: upload/download Excel) ----
-
-// GET current product taxonomy
-app.get("/api/products/taxonomy", (req, res) => res.json(db.productTaxonomy));
-
-// POST replace product taxonomy with rows parsed from the uploaded Excel file
-// expects: [{ sku, category, subCategory, mrp, caseSize }, ...]
-// Each row is assigned a backend-generated unique "code" that can be used to
-// reference the product elsewhere (stock, performance, forecast, etc.)
-app.post("/api/products/taxonomy", (req, res) => {
-  const rows = Array.isArray(req.body) ? req.body : [];
-  db.productTaxonomy = rows.map((r) => ({
-    code: String(r.code ?? "").trim(),
-    sku: String(r.sku ?? "").trim(),
-    category: String(r.category ?? "").trim(),
-    subCategory: String(r.subCategory ?? "").trim(),
-    mrp: Number(r.mrp) || 0,
-    caseSize: Number(r.caseSize) || 0,
-  }));
-  res.json({ message: "Product taxonomy imported", count: db.productTaxonomy.length });
+// ─────────────────────────── Product Performance ───────────────────────────
+app.get("/api/product-performance", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const rows = db.stockUpdate
+    .filter(su => su.siteId === siteId)
+    .map(su => {
+      const prod = db.products.find(p => p.code === su.productCode) || {};
+      const perf = db.productPerformance.find(p => p.productCode === su.productCode && p.siteId === siteId) || {};
+      return {
+        productCode: su.productCode,
+        productName: prod.name || su.productCode,
+        brand: prod.brand || "",
+        category: prod.category || "",
+        subCategory: prod.subCategory || "",
+        mrp: prod.mrp || 0,
+        qtyPerDay: perf.qtyPerDay || null,
+        method: perf.method || null,
+        updatedAt: perf.updatedAt || null,
+      };
+    });
+  res.json(rows);
 });
 
-// ------------------------- Start -------------------------
+app.post("/api/product-performance", (req, res) => {
+  const { productCode, siteId, qtyPerDay, method } = req.body;
+  let perf = db.productPerformance.find(p => p.productCode === productCode && p.siteId === Number(siteId));
+  if (!perf) {
+    perf = { productCode, siteId: Number(siteId) };
+    db.productPerformance.push(perf);
+  }
+  perf.qtyPerDay = Number(qtyPerDay);
+  perf.method = method || "manual";
+  perf.updatedAt = new Date().toISOString();
+  res.json(perf);
+});
+
+app.post("/api/product-performance/auto-calculate", (req, res) => {
+  const { siteId } = req.body;
+  const sid = Number(siteId);
+  const products = [...new Set(db.stockHistory.filter(h => h.siteId === sid).map(h => h.productCode))];
+  const updated = [];
+
+  products.forEach(code => {
+    const hist = db.stockHistory
+      .filter(h => h.siteId === sid && h.productCode === code)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+
+    if (hist.length < 2) return;
+    const latest = hist[0], prev = hist[1];
+    const daysBetween = (new Date(latest.updatedAt) - new Date(prev.updatedAt)) / (1000 * 60 * 60 * 24);
+    if (daysBetween < 0.1) return;
+    const consumed = prev.qty - latest.qty;
+    if (consumed <= 0) return;
+    const qtyPerDay = +(consumed / daysBetween).toFixed(2);
+
+    let perf = db.productPerformance.find(p => p.productCode === code && p.siteId === sid);
+    if (!perf) { perf = { productCode: code, siteId: sid }; db.productPerformance.push(perf); }
+    perf.qtyPerDay = qtyPerDay;
+    perf.method = "auto";
+    perf.updatedAt = new Date().toISOString();
+    updated.push(code);
+  });
+
+  res.json({ updated });
+});
+
+// ─────────────────────────── Forecast ───────────────────────────
+app.get("/api/forecast", (req, res) => {
+  const siteId = Number(req.query.siteId);
+  const site = db.sites.find(s => s.id === siteId);
+  if (!site) return res.json([]);
+
+  const rows = db.stockUpdate
+    .filter(su => su.siteId === siteId)
+    .map(su => {
+      const prod = db.products.find(p => p.code === su.productCode) || {};
+      const perf = db.productPerformance.find(p => p.productCode === su.productCode && p.siteId === siteId);
+      const qtyPerDay = perf?.qtyPerDay || 0;
+      const availDays = qtyPerDay > 0 ? +(su.qty / qtyPerDay).toFixed(2) : null;
+      const status = statusFor(availDays, db.statusDefs);
+      const preferredDays = getSitePreferredDays(siteId, su.productCode);
+      const caseSize = Math.max(1, Number(prod.caseSize) || 1);
+
+      let orderQty = 0;
+      if (status === "Critical" && qtyPerDay > 0) {
+        const deficit = (preferredDays * qtyPerDay) - su.qty;
+        if (deficit > 0) orderQty = Math.ceil(deficit / caseSize) * caseSize;
+      }
+
+      return {
+        productCode: su.productCode,
+        productName: prod.name || su.productCode,
+        brand: prod.brand || "",
+        category: prod.category || "",
+        subCategory: prod.subCategory || "",
+        mrp: prod.mrp || 0,
+        caseSize,
+        availableQty: su.qty,
+        preferredDays,
+        availableDays: availDays,
+        status,
+        orderQty,
+      };
+    })
+    .sort((a, b) => (a.availableDays ?? 999) - (b.availableDays ?? 999));
+
+  res.json(rows);
+});
+
+// ─────────────────────────── Orders ───────────────────────────
+app.get("/api/orders", (req, res) => {
+  const siteId = req.query.siteId ? Number(req.query.siteId) : null;
+  const list = siteId ? db.orders.filter(o => o.siteId === siteId) : db.orders;
+  res.json(list);
+});
+
+app.post("/api/orders", (req, res) => {
+  const order = {
+    id: nextOrderId(),
+    status: "Pending Approval",
+    createdAt: new Date().toISOString(),
+    feedback: "",
+    ...req.body,
+    siteId: Number(req.body.siteId),
+  };
+  db.orders.unshift(order);
+  res.status(201).json(order);
+});
+
+app.put("/api/orders/:id", (req, res) => {
+  const order = db.orders.find(o => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  Object.assign(order, req.body, { id: order.id });
+  res.json(order);
+});
+
+// ─────────────────────────── Start ───────────────────────────
 const PORT = 5000;
 app.listen(PORT, () => console.log(`✅ Pantry API running at http://localhost:${PORT}`));
